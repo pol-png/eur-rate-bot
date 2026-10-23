@@ -1,21 +1,19 @@
 """
-Проверка курса евро за рубли во Freedom Bank (мобильное приложение)
-для запуска по расписанию в GitHub Actions.
+Курс евро за рубли во Freedom Bank (мобильное приложение).
+Запускается по расписанию в GitHub Actions каждые 15 минут.
+
+Сообщения приходят в двух случаях:
+  1) регулярно — по будням в 09:00, 12:30 и 16:00, по выходным в 12:30
+     (время московское, UTC+3);
+  2) при снижении курса — первое при достижении порога TARGET,
+     дальше при каждом падении ещё на STEP рублей.
 
 Настройки берутся из GitHub:
   BOT_TOKEN — секрет, токен бота от BotFather
   OWNER_ID  — секрет, ваш chat_id
   TARGET    — переменная, порог в рублях за 1 евро (например 98)
 
-Уведомления:
-  — первое, когда курс впервые опустился до порога;
-  — затем каждый раз, когда курс опускается ещё на STEP рублей
-    ниже цены последнего уведомления.
-Если курс поднимается выше порога, отсчёт начинается заново.
-
 Состояние хранится в state.json.
-Если банк не отвечает, бот делает несколько попыток, а затем
-спокойно завершает работу до следующей проверки.
 """
 import datetime
 import json
@@ -27,7 +25,12 @@ import requests
 
 RATES_URL = "https://bankffin.kz/api/exchange-rates/getRates"
 STATE_FILE = "state.json"
-STEP = 0.5            # на сколько рублей курс должен упасть для нового сообщения
+
+STEP = 0.5                                  # шаг снижения для нового сообщения, ₽
+TZ_OFFSET = 3                               # часовой пояс пользователя, UTC+3
+TIMES_WEEKDAY = ["09:00", "12:30", "16:00"]  # регулярные сообщения, будни
+TIMES_WEEKEND = ["12:30"]                    # регулярные сообщения, выходные
+
 ATTEMPTS = 3          # сколько раз пробовать достучаться до банка
 PAUSE = 20            # пауза между попытками, секунд
 
@@ -43,6 +46,19 @@ class BankUnavailable(Exception):
 def num(s):
     """Банк пишет крупные числа с пробелами: '11 595.28'."""
     return float(str(s).replace(" ", "").replace(",", "."))
+
+
+def local_now():
+    """Текущее время в часовом поясе пользователя (сервер GitHub живёт по UTC)."""
+    tz = datetime.timezone(datetime.timedelta(hours=TZ_OFFSET))
+    return datetime.datetime.now(tz)
+
+
+def due_slot(now):
+    """Последнее наступившее сегодня время регулярного сообщения, иначе None."""
+    times = TIMES_WEEKEND if now.weekday() >= 5 else TIMES_WEEKDAY
+    passed = [t for t in times if t <= now.strftime("%H:%M")]
+    return f"{now:%Y-%m-%d} {passed[-1]}" if passed else None
 
 
 def fetch_rates():
@@ -93,35 +109,18 @@ def save_state(state):
         f.write("\n")
 
 
-def main():
-    if not TARGET_RAW:
-        print("Порог TARGET не задан в настройках репозитория — проверка пропущена.")
-        return
-    target = num(TARGET_RAW)
-
-    # Сначала курс: если банк молчит, ничего больше делать не нужно
-    price = get_eur_price()
-    print(f"Курс в приложении: 1 € = {price:.2f} ₽, порог: {target:.2f} ₽")
-
-    state = load_state()
-    if state.get("target") != target:
-        # Порог изменился — начинаем следить заново
-        state = {"target": target, "alerted": False}
-        send(f"Порог установлен: сообщу, когда 1 € будет стоить не больше {target:.2f} ₽, "
-             f"и дальше при каждом снижении ещё на {STEP:g} ₽.")
-
+def check_drop(price, target, state):
+    """Сообщения о снижении курса."""
     if price > target:
         # Курс выше порога — отсчёт начинается заново
         state["alerted"] = False
         state.pop("last", None)
     elif not state.get("alerted"):
-        # Первое пересечение порога
         send(f"🔔 Евро подешевел: 1 € = {price:.2f} ₽ (ваш порог {target:.2f} ₽).\n"
              "Перед покупкой проверьте курс в приложении банка.")
         state["alerted"] = True
         state["last"] = price
     else:
-        # Уже сообщали — ждём снижения ещё на STEP рублей
         last = state.get("last", target)
         if price <= last - STEP:
             send(f"🔔 Евро ещё подешевел: 1 € = {price:.2f} ₽ "
@@ -129,8 +128,53 @@ def main():
                  "Перед покупкой проверьте курс в приложении банка.")
             state["last"] = price
 
+
+def report(price, state, now):
+    """Регулярное сообщение с текущим курсом по расписанию."""
+    slot = due_slot(now)
+    if slot is None or state.get("report") == slot:
+        return
+
+    before = state.get("report_price")
+    if before is None:
+        change = ""
+    elif price < before:
+        change = f"\nЭто на {before - price:.2f} ₽ дешевле прошлого раза ({before:.2f} ₽)."
+    elif price > before:
+        change = f"\nЭто на {price - before:.2f} ₽ дороже прошлого раза ({before:.2f} ₽)."
+    else:
+        change = f"\nБез изменений с прошлого раза."
+
+    send(f"📊 Курс евро: 1 € = {price:.2f} ₽.{change}")
+    state["report"] = slot
+    state["report_price"] = price
+
+
+def main():
+    if not TARGET_RAW:
+        print("Порог TARGET не задан в настройках репозитория — проверка пропущена.")
+        return
+    target = num(TARGET_RAW)
+    now = local_now()
+
+    # Сначала курс: если банк молчит, ничего больше делать не нужно
+    price = get_eur_price()
+    print(f"{now:%Y-%m-%d %H:%M} — 1 € = {price:.2f} ₽, порог: {target:.2f} ₽")
+
+    state = load_state()
+    if state.get("target") != target:
+        # Порог изменился — начинаем следить заново
+        state = {k: v for k, v in state.items() if k in ("report", "report_price")}
+        state["target"] = target
+        state["alerted"] = False
+        send(f"Порог установлен: сообщу, когда 1 € будет стоить не больше {target:.2f} ₽, "
+             f"и дальше при каждом снижении ещё на {STEP:g} ₽.")
+
+    check_drop(price, target, state)
+    report(price, state, now)
+
     # Раз в месяц файл меняется — это не даёт GitHub отключить расписание
-    state["month"] = datetime.date.today().strftime("%Y-%m")
+    state["month"] = f"{now:%Y-%m}"
     save_state(state)
 
 
