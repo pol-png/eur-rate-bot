@@ -2,5 +2,7 @@
   "target": 98.0,
   "alerted": true,
   "month": "2026-10",
-  "last": 93.94
+  "last": 93.94,
+  "report": "2026-10-23 16:00",
+  "report_price": 93.94
 }
